@@ -11,7 +11,7 @@ FORMAT = clang-format
 all: httpserver
 
 httpserver : httpserver.o
-	$(CC) -o httpserver httpserver.o socket_bytes_handlers.a
+	$(CC) -o httpserver httpserver.o asgn4_helper_funcs.a
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
@@ -24,4 +24,3 @@ format: $(FORMATS)
 %.fmt: %.c
 	$(FORMAT) -i $<
 	touch $@
-

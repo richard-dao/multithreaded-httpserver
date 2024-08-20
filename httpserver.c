@@ -1,412 +1,333 @@
-#include <stdio.h>
-#include <stdbool.h>
+#include "helper_funcs_socket.h"
+#include "connection.h"
+#include "response.h"
+#include "request.h"
+#include "queue.h"
+#include "rwlock.h"
+
 #include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <stdio.h>
 #include <string.h>
-#include <errno.h>
-#include <regex.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <sys/file.h>
+#include <err.h>
+#include <errno.h>
 
-#include "socket_bytes_handlers.h"
-char buffer[4096];
-char *temp;
-int port;
-Listener_Socket ls;
+int num_threads = 4;
 
-char *STAT_CODE_200 = "OK\n";
-char *STAT_CODE_201 = "Created\n";
-char *ERR_CODE_400 = "Bad Request\n";
-char *ERR_CODE_403 = "Forbidden\n";
-char *ERR_CODE_404 = "Not Found\n";
-char *ERR_CODE_500 = "Internal Server Error\n";
-char *ERR_CODE_501 = "Not Implemented\n";
-char *ERR_CODE_505 = "Version Not Supported\n";
+void handle_connection(int);
+void handle_get(conn_t *);
+void handle_put(conn_t *);
+void handle_unsupported(conn_t *);
 
-// Writing from buffer into file
-int bufferWriteAlgorithm(char *buff, int fd, int totalBytes) {
-    int totalWritten = 0;
-    while (totalWritten < totalBytes) {
-        int w = write(fd, buff + totalWritten, totalBytes - totalWritten);
-        if (w == -1) {
-            return -1;
-        }
-        totalWritten += w;
-    }
-    return totalWritten;
+typedef struct Node {
+    char *key;
+    rwlock_t *rwlock;
+    struct Node *next;
+} node_t;
+
+queue_t *q;
+node_t *list_head;
+pthread_mutex_t m;
+
+node_t *new_Node(char *k, node_t *nxt) {
+    node_t *node = (node_t *) malloc(sizeof(node_t));
+    node->key = strdup(k);
+    node->rwlock = rwlock_new(N_WAY, 1);
+    node->next = nxt;
+    return node;
 }
 
-// Sends response to the socket in specific format
-void sendResponse(int socket, char *statusCode, char *messageBody, unsigned long bytes) {
-    dprintf(socket, "HTTP/1.1 %s\r\nContent-Length: %lu\r\n\r\n", statusCode, bytes);
-    if (strcmp(messageBody, "") != 0) {
-        write_n_bytes(socket, messageBody, strlen(messageBody));
+int listSearch(char *key) {
+    node_t *curr = list_head;
+    while (curr != NULL && curr->key != NULL) {
+        if (strcmp(curr->key, key) == 0) {
+            return 1;
+        }
+        curr = curr->next;
+    }
+    return 0;
+}
+
+void lockNode(char *key, bool reader) {
+    node_t *curr = list_head;
+
+    // To lock a rwlock that already exists
+    while (curr->next != NULL) {
+        if (strcmp(curr->key, key) == 0) {
+            if (reader) {
+                reader_lock(curr->rwlock);
+                return;
+            } else {
+                writer_lock(curr->rwlock);
+                return;
+            }
+        }
+        curr = curr->next;
     }
 }
 
-bool validHeader(char *b, int ind, int total) {
-    while (ind < total) {
-        int x = 0;
-        while (x <= 128 && ind < total) {
-            char character = b[ind];
-            // fprintf(stderr, "%c\n", character);
-
-            if (character == ':' || character == '\r') {
-                break;
-            } else if (!((character == 45) || (character == 46)
-                           || (character >= 48 && character <= 57)
-                           || (character >= 97 && character <= 122)
-                           || (character >= 65 && character <= 90))) {
-                // fprintf(stderr, "Invalid Character: %c", character);
-                return false;
+void unlockNode(char *key, bool reader) {
+    node_t *curr = list_head;
+    while (curr->next != NULL) {
+        if (strcmp(curr->key, key) == 0) {
+            if (reader) {
+                reader_unlock(curr->rwlock);
+                return;
+            } else {
+                writer_unlock(curr->rwlock);
+                return;
             }
-            ind++;
-            x++;
         }
-        ind++;
-
-        if (x > 128 && x != 0) {
-            // fprintf(stderr, "False 2\n");
-            return false;
-        }
-
-        if (x == 0 && b[ind] == '\n') {
-            // fprintf(stderr, "True 3\n");
-            return true;
-        }
-
-        while (b[ind] == ' ' && ind < total) {
-            // fprintf(stderr, "Makes it here\n");
-            ind++;
-        }
-
-        int y = 0;
-        while (y <= 128 && ind < total) {
-            if (b[ind] == '\r') {
-                break;
-            }
-            char character = b[ind];
-            if (!(character >= 32 && character <= 126)) {
-                // fprintf(stderr, "False 4\n");
-                return false;
-            }
-            ind++;
-            y++;
-        }
-
-        if (y > 128 && y != 0) {
-            // fprintf(stderr, "False 5\n");
-            return false;
-        }
-
-        ind++;
-
-        if (b[ind] != '\n') {
-            return false;
-        }
-        ind++;
-
-        if ((x == 0 && y != 0) || (x != 0 && y == 0)) {
-            // fprintf(stderr, "False 6\n");
-            return false;
-        }
-        if (y == 0 && x == 0) {
-            break;
-        }
+        curr = curr->next;
     }
-    // fprintf(stderr, "True 7\n");
-    return true;
 }
 
-ssize_t read_until(int in, char buf[], size_t nbytes) {
-    size_t total = 0;
-    int pos = 0; // Buffer index
-    char readChar;
+void insertNode(char *key) {
+    if (list_head == NULL) {
+        list_head = new_Node(key, NULL);
+        // fprintf(stderr, "Makes new head correctly?\n");
 
-    regex_t temp;
-    int ret = regcomp(&temp, "\r\n\r\n", 0);
-    ret = regexec(&temp, buf, 0, NULL, 0);
+        return;
+    }
+    node_t *curr = list_head;
+    while (curr->next != NULL) {
+        curr = curr->next;
+    }
+    curr->next = new_Node(key, NULL);
+}
 
-    while (ret != 0) {
-        total += read(in, &readChar, 1);
-        // fprintf(stderr, "%c\n", readChar);
-        buf[pos] = readChar;
-        pos++;
-        ret = regexec(&temp, buf, 0, NULL, 0);
+void deleteList(node_t **head) {
+    while ((*head) != NULL) {
+        node_t *tempNext = (*head)->next;
+        rwlock_delete(&((*head)->rwlock));
+        free((*head));
+        (*head) = tempNext;
+    }
+}
 
-        if (total >= nbytes) {
-            return total;
+void fake_flock(char *URI, int mode, int oper) {
+    // Mode 0 == LOCK_SH
+    // Mode 1 == LOCK_EX
+    // Mode 2 == LOCK_UN
+
+    // First check if URI exists in list
+    int exists = listSearch(URI);
+
+    // fprintf(stderr, "Does the URI: %s exist? %d\n", URI, exists);
+
+    if (exists == 0) {
+        // fprintf(stderr, "Attempts to add node.\n");
+        insertNode(URI);
+        // fprintf(stderr, "Inserts Node successfully?\n");
+    }
+
+    if (mode == 0) {
+        lockNode(URI, true);
+        // fprintf(stderr, "Locks Node for reading successfully?\n");
+    } else if (mode == 1) {
+        lockNode(URI, false);
+        // fprintf(stderr, "Locks Node for writing successfully?\n");
+    } else {
+        if (oper == 0) {
+            unlockNode(URI, true);
+            // fprintf(stderr, "Unlocks Node from reading successfully?\n");
+        } else {
+            unlockNode(URI, false);
+            // fprintf(stderr, "Unlocks Node from writing successfully?\n");
         }
     }
-    return total;
+}
+
+void *worker_thread() {
+    while (1) {
+        uintptr_t connfd = 0;
+        queue_pop(q, (void **) &connfd);
+        handle_connection(connfd);
+        close(connfd);
+    }
+    return (void *) 1;
+}
+
+void handle_memory(int signal) {
+    queue_delete(&q);
+    pthread_mutex_destroy(&m);
+    deleteList(&list_head);
+    exit(signal);
 }
 
 int main(int argc, char **argv) {
-    // Check if amount of args for port number is valid
-    if (argc != 2) {
-        fprintf(stderr, "Invalid Port");
-        exit(1);
-    }
-    port = strtol(argv[1], &temp, 10);
-
-    // Check port within valid range
-    if (port <= 0 || port >= 65536) {
-        fprintf(stderr, "Invalid Port");
-        exit(1);
+    if (argc < 3) {
+        warnx("wrong arguments: %s port_num", argv[0]);
+        fprintf(stderr, "invalid arguments");
+        return EXIT_FAILURE;
     }
 
-    // Listen to socket at port
-    int rc_li = listener_init(&ls, port);
-
-    // Check if port could be listened
-    if (rc_li == -1) {
-        fprintf(stderr, "Invalid Port");
-        exit(1);
+    int c;
+    while ((c = getopt(argc, argv, "t:")) != -1) {
+        switch (c) {
+        case 't': num_threads = atoi(optarg); break;
+        default: fprintf(stderr, "usage: -t <threadcount> %s <port\n", argv[0]);
+        }
     }
 
-    int socket;
-    int readBytes;
-    int index;
-    int counter;
-    int regexCode;
-    int contentLength;
-    char method[9];
-    char URI[65];
-    char version[10];
-    regex_t rules;
+    char *endptr = NULL;
+    size_t port = (size_t) strtoull(argv[optind], &endptr, 10);
 
-    // Main server loop
-    while (true) {
-        // Accept the listener socket
-        socket = listener_accept(&ls);
+    if (endptr && *endptr != '\0') {
+        warnx("invalid port number: %s", argv[optind]);
+        return EXIT_FAILURE;
+    }
 
-        // Read 2048 bytes from socket into buffer
+    // Thread crap that was done in section
+    // Dispatcher
 
-        readBytes = read_until(socket, buffer, 2048);
+    signal(SIGPIPE, SIG_IGN);
 
-        if (readBytes == 0) {
-            close(socket);
-            continue;
-        }
-        // Check if bytes could be read
-        if (readBytes == -1) {
-            fprintf(stderr, "%d\n", errno);
-            exit(1);
-        }
+    // Thread threads[num_threads];
+    pthread_t threads[num_threads];
+    q = queue_new(num_threads);
 
-        // fprintf(stderr, "Request Message: %s\n", buffer);
+    for (int i = 0; i < num_threads; i++) {
 
-        // Read method from buffer
-        index = 0;
-        counter = 0;
-        while (buffer[index] != ' ' && counter < 8) {
-            method[counter] = buffer[index];
-            index++;
-            counter++;
-        }
-        index++;
-        method[counter] = '\0';
+        pthread_create(&threads[i], NULL, worker_thread, (void *) ((uintptr_t) i));
+    }
 
-        // Check if method is valid
-        if (buffer[index] != '/') {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            continue;
-        }
+    pthread_mutex_init(&m, NULL);
+    signal(SIGINT, handle_memory);
+    signal(SIGTERM, handle_memory);
 
-        regcomp(&rules, "^[A-Za-z0-9\\.\\-]*$", 0);
-        regexCode = regexec(&rules, method, 0, NULL, 0);
+    Listener_Socket sock;
+    listener_init(&sock, port);
 
-        if (regexCode != 0) {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            regfree(&rules);
-            continue;
-        }
+    while (1) {
+        uintptr_t connfd = listener_accept(&sock);
+        queue_push(q, (void *) connfd);
+    }
+    pthread_mutex_destroy(&m);
+    queue_delete(&q);
+    deleteList(&list_head);
+    return EXIT_SUCCESS;
+}
 
-        // fprintf(stderr, "METHOD: %s\n", method);
+void handle_connection(int connfd) {
+    conn_t *conn = conn_new(connfd);
 
-        // Read URI from buffer
-        counter = 0;
-        index++;
-        while (buffer[index] != ' ' && counter < 64) {
-            URI[counter] = buffer[index];
-            index++;
-            counter++;
-        }
-        index++;
-        URI[counter] = '\0';
+    const Response_t *res = conn_parse(conn);
 
-        // Check if URI is valid
-        if (strlen(URI) < 2 || buffer[index] != 'H') {
-            // // fprintf(stderr, "%lu, %c, %s", strlen(URI), buffer[index-1], URI);
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            continue;
-        }
-
-        regexCode = regexec(&rules, URI, 0, NULL, 0);
-        if (regexCode != 0) {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            regfree(&rules);
-            continue;
-        }
-
-        // fprintf(stderr, "URI: %s\n", URI);
-
-        // Read version from buffer
-        counter = 0;
-        while (buffer[index] != '\r' && counter < 9) {
-            version[counter] = buffer[index];
-            index++;
-            counter++;
-        }
-        index++;
-        version[counter] = '\0';
-
-        // Check version fits regex-format
-        regfree(&rules);
-        regcomp(&rules, "HTTP\\/[0-9]\\.[0-9]$", 0);
-        regexCode = regexec(&rules, version, 0, NULL, 0);
-        if (regexCode != 0) {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            regfree(&rules);
-            continue;
-        }
-
-        regfree(&rules);
-
-        // Check if version is specifically 1.1
-        if (strcmp(version, "HTTP/1.1") != 0) {
-            sendResponse(socket, "505 Version Not Supported", ERR_CODE_505, strlen(ERR_CODE_505));
-            close(socket);
-            continue;
-        }
-
-        // fprintf(stderr, "Version: %s\n", version);
-
-        // Header handling
-        char *header = strstr(buffer, "Content-Length:");
-        contentLength = 0;
-
-        if (header != NULL) {
-            char buffer2[129];
-            int offset = 0;
-            counter = 16;
-            while (counter < readBytes) {
-                if (header[counter] == '\r') {
-                    break;
-                }
-                buffer2[offset] = header[counter];
-                offset++;
-                counter++;
-            }
-            buffer2[offset] = '\0';
-            contentLength = strtol(buffer2, &temp, 10);
-        }
-
-        // fprintf(stderr, "Content-Length: %d\n", contentLength);
-
-        if (buffer[index] != '\n') {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            continue;
-        }
-
-        if (!validHeader(buffer, index + 1, readBytes)) {
-            sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-            close(socket);
-            continue;
-        }
-        if (strcmp(method, "GET") == 0) {
-            int fd = open(URI, O_RDONLY);
-            struct stat f1;
-            int checker = fstat(fd, &f1);
-            fprintf(stderr, "Checker: %d\n", checker);
-
-            if (fd == -1) {
-                if (errno == EACCES) {
-                    sendResponse(socket, "403 Forbidden", ERR_CODE_403, strlen(ERR_CODE_403));
-                    close(socket);
-                    continue;
-                } else {
-                    sendResponse(socket, "404 Not Found", ERR_CODE_404, strlen(ERR_CODE_404));
-                    close(socket);
-                    continue;
-                }
-            }
-
-            if (S_ISDIR(f1.st_mode)) {
-                sendResponse(socket, "403 Forbidden", ERR_CODE_403, strlen(ERR_CODE_403));
-                close(socket);
-                continue;
-            }
-            sendResponse(socket, "200 OK", "", f1.st_size);
-            pass_n_bytes(fd, socket, f1.st_size);
-            close(fd);
-        } else if (strcmp(method, "PUT") == 0) {
-            int fd = open(URI, O_WRONLY | O_TRUNC, 0400 | S_IWUSR);
-            if (fd == -1) {
-                fd = open(URI, O_WRONLY | O_CREAT | O_TRUNC, 0400 | S_IWUSR);
-                struct stat f1;
-                fstat(fd, &f1);
-
-                if (fd == -1) {
-                    if (S_ISDIR(f1.st_mode) || errno == EACCES) {
-                        sendResponse(socket, "403 Forbidden", ERR_CODE_403, strlen(ERR_CODE_403));
-                        close(socket);
-                        continue;
-                    }
-                    sendResponse(
-                        socket, "500 Internal Server Error", ERR_CODE_500, strlen(ERR_CODE_500));
-                    close(socket);
-                    continue;
-                }
-
-                char *body = strstr(buffer, "\r\n\r\n");
-                if (body == NULL) {
-                    sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-                    close(socket);
-                    continue;
-                }
-                if (strcmp(body, "\r\n\r\n\0") != 0) {
-                    contentLength -= bufferWriteAlgorithm(body + 4, fd, contentLength);
-                }
-                if (pass_n_bytes(socket, fd, contentLength) == -1) {
-                    sendResponse(
-                        socket, "500 Internal Server Error", ERR_CODE_500, strlen(ERR_CODE_500));
-                    close(socket);
-                    continue;
-                }
-                sendResponse(socket, "201 Created", STAT_CODE_201, strlen(STAT_CODE_201));
-            } else {
-                char *body = strstr(buffer, "\r\n\r\n");
-                if (body == NULL) {
-                    sendResponse(socket, "400 Bad Request", ERR_CODE_400, strlen(ERR_CODE_400));
-                    close(socket);
-                    continue;
-                }
-                if (strcmp(body, "\r\n\r\n\0") != 0) {
-                    contentLength -= bufferWriteAlgorithm(body + 4, fd, contentLength);
-                }
-                if (pass_n_bytes(socket, fd, contentLength) == -1) {
-                    sendResponse(
-                        socket, "500 Internal Server Error", ERR_CODE_500, strlen(ERR_CODE_500));
-                    close(socket);
-                    continue;
-                }
-                sendResponse(socket, "200 OK", STAT_CODE_200, strlen(STAT_CODE_200));
-            }
-            close(fd);
+    if (res != NULL) {
+        conn_send_response(conn, res);
+    } else {
+        const Request_t *req = conn_get_request(conn);
+        if (req == &REQUEST_GET) {
+            handle_get(conn);
+        } else if (req == &REQUEST_PUT) {
+            handle_put(conn);
         } else {
-            sendResponse(socket, "501 Not Implemented", ERR_CODE_501, strlen(ERR_CODE_501));
-            close(socket);
-            continue;
+            handle_unsupported(conn);
         }
-        close(socket);
     }
-    return 0;
+    conn_delete(&conn);
+}
+
+void handle_get(conn_t *conn) {
+    char *URI = conn_get_uri(conn);
+    const Response_t *res = NULL;
+
+    int fd = open(URI, O_RDONLY);
+
+    if (fd == -1) {
+        if (errno == EACCES) {
+            fprintf(stderr, "%s,%s,%d,%s\n", "GET", URI, 403, conn_get_header(conn, "Request-Id"));
+            res = &RESPONSE_FORBIDDEN;
+            conn_send_response(conn, res);
+            return;
+        } else if (errno == ENOENT) {
+            fprintf(stderr, "%s,%s,%d,%s\n", "GET", URI, 404, conn_get_header(conn, "Request-Id"));
+            res = &RESPONSE_NOT_FOUND;
+            conn_send_response(conn, res);
+            return;
+        } else {
+            fprintf(stderr, "%s,%s,%d,%s\n", "GET", URI, 500, conn_get_header(conn, "Request-Id"));
+            res = &RESPONSE_INTERNAL_SERVER_ERROR;
+            conn_send_response(conn, res);
+            return;
+        }
+    }
+
+    fake_flock(URI, 0, 0);
+    // flock(fd, LOCK_SH);
+    struct stat buf1;
+    fstat(fd, &buf1);
+
+    if (S_ISDIR(buf1.st_mode)) {
+        res = &RESPONSE_FORBIDDEN;
+        fake_flock(URI, 2, 0);
+        // flock(fd, LOCK_UN);
+        close(fd);
+        conn_send_response(conn, res);
+        return;
+    }
+
+    conn_send_file(conn, fd, buf1.st_size);
+    fprintf(stderr, "%s,%s,%d,%s\n", "GET", URI, 200, conn_get_header(conn, "Request-Id"));
+    fake_flock(URI, 2, 0);
+    // flock(fd, LOCK_UN);
+    close(fd);
+
+    return;
+}
+
+void handle_put(conn_t *conn) {
+    char *URI = conn_get_uri(conn);
+    const Response_t *res = NULL;
+
+    pthread_mutex_lock(&m);
+
+    bool exists = access(URI, F_OK) == 0;
+
+    int fd = open(URI, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (fd < 0) {
+        if (errno == EACCES || errno == EISDIR || errno == ENOENT) {
+            fprintf(stderr, "%s,%s,%d,%s\n", "PUT", URI, 403, conn_get_header(conn, "Request-Id"));
+            res = &RESPONSE_FORBIDDEN;
+            conn_send_response(conn, res);
+            return;
+        } else {
+            fprintf(stderr, "%s,%s,%d,%s\n", "PUT", URI, 500, conn_get_header(conn, "Request-Id"));
+            res = &RESPONSE_INTERNAL_SERVER_ERROR;
+            conn_send_response(conn, res);
+            return;
+        }
+    }
+
+    fake_flock(URI, 1, 1);
+    // flock(fd, LOCK_EX);
+    pthread_mutex_unlock(&m);
+
+    res = conn_recv_file(conn, fd);
+
+    if (exists && res == NULL) {
+        res = &RESPONSE_OK;
+        fprintf(stderr, "%s,%s,%d,%s\n", "PUT", URI, 200, conn_get_header(conn, "Request-Id"));
+    } else if (!exists && res == NULL) {
+        res = &RESPONSE_CREATED;
+        fprintf(stderr, "%s,%s,%d,%s\n", "PUT", URI, 201, conn_get_header(conn, "Request-Id"));
+    }
+
+    conn_send_response(conn, res);
+    fake_flock(URI, 2, 1);
+    // flock(fd, LOCK_UN);
+    close(fd);
+    return;
+}
+
+void handle_unsupported(conn_t *conn) {
+    const Response_t *res = NULL;
+    res = &RESPONSE_NOT_IMPLEMENTED;
+    conn_send_response(conn, res);
+    fprintf(stderr, "%s,%s,%d,%s\n", "", "", 501, "0");
 }
