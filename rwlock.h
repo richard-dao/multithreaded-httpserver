@@ -1,8 +1,9 @@
 /**
  * @File rwlock.h
  *
+ * The header file that you need to implement for assignment 3.
  *
- * @author Richard Dao
+ * @author Andrew Quinn, Mitchell Elliott, and Gurpreet Dhillon.
  */
 
 #pragma once
@@ -61,3 +62,7 @@ void writer_lock(rwlock_t *rw);
  *
  */
 void writer_unlock(rwlock_t *rw);
+
+int reader_wait(rwlock_t *rw);
+
+int writer_wait(rwlock_t *rw);

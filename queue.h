@@ -1,8 +1,9 @@
 /**
  * @File queue.h
  *
+ * The header file that you need to implement for assignment 3.
  *
- * @author Richard Dao
+ * @author Andrew Quinn
  */
 
 #pragma once
