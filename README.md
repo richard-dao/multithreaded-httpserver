@@ -1,11 +1,11 @@
-# A Simple HTTPServer in C
+# A Multi-Threaded HTTPServer in C
 
 ## Running the server
 The server takes a single-command line argument, an int, named _port_.
 
 After building the files with `make`, you can start the httpserver with:
 
-`./httpserver <port>`
+`./httpserver [-t threads] <port>`
 
 ## Execution
 
@@ -39,6 +39,12 @@ Here are examples of valid GET and PUT requests:
 `PUT /foo.txt HTTP/1.1\r\nContent-Length: 21\r\n\r\nHello foo, I am World`
 
 `PUT /new.txt HTTP/1.1\r\nContent-Length: 14\r\n\r\nHello\nI am new`
+
+## Multithreading
+THe server uses a thread-pool design, which utilizes worker threads and a single dispatcher thread. This is implemented using the POSIX threads library and handles atomic and coherent requests.
+
+# Thread Safety
+In order to ensure coherent and atomic linearization, the server implements a thread-safe queue by utilizing reader-writer locks classes. These classes allow for multiple readers can request a resource but only a single writer can write to a resource at a time. Implements placing a shared lock, an exclusive lock, or removing a lock. (In other words it implements `flock()` from scratch.
 
 ## Responses
 Standard HTTP status codes are supported including: 200, 201, 400, 403, 404, 500, 501, 505.
